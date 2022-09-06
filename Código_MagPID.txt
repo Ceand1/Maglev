@@ -1,0 +1,225 @@
+//O algoritmo faz vários ciclos de leitura, e a cada ciclo, de acordo com os dados do hall e os cálculos de erro, as constantes PID são incrementadas para uma maior estabilidade 
+
+#define MIN_PWM_VALUE         0          //Duty cycle mínimo do PWM
+#define MAX_PWM_VALUE         255        //Duty cycle máximo do PWM
+#define IDLE_TIMEOUT_PERIOD   3000       //Tempo pra parada caso um ímã permanente não seja detectado (3 segundos)
+#define MIN_MAG_LIMIT         520        //Valor do sensor hall para ativação
+#define PID_UPDATE_INTERVAL   1          //Intervalo de atualização do PWM (1 ms)
+
+#define DEFAULT_TARGET_VALUE  300       //Leitura padrão do hall
+#define DEFAULT_KP            105        //Kp padrão
+#ifndef QUIETMODE                    
+  #define DEFAULT_KD          5       //Kd padrão
+  #else //sem espera
+  #define DEFAULT_KD            23.7
+#endif //sem espera
+
+#define DEFAULT_KI            0.001     //Ki padrão
+#define DEFAULT_MAX_INTEGRAL  1024      //Ki máximo
+
+//Incremento para comandos seriais
+#define KP_INCREMENT          0.01        
+#define KD_INCREMENT          0.1        
+#define KI_INCREMENT          0.0001     
+#define VALUE_INCREMENT       1         
+
+#define FILTERFACTOR 10                   // Fator de filtragem para o dado do hall
+
+int roundValue(float value)
+{
+  return (int)(value + 0.5);
+}
+
+const int coilPin = 10; //Pino da base do transistor
+const int hallSensorPin = A0; //Pino de dados do hall
+const int gMidpoint = roundValue((MAX_PWM_VALUE - MIN_PWM_VALUE) / 2); //Ponto médio do PWM
+
+boolean gIdle = false; // Usado para verificar se existe um ímã permanente
+signed int gIdleTime = 0; //Usado para IDLE_TIMEOUT_PERIOD não estourar
+signed int gNextPIDCycle = 0; //Usado para PID_UPDATE_INTERVAL nçao estourar
+
+int gCurrentDutyCycle = 0; //PWM atual
+int gLastSensorReadout = 0; //Última leitura do hall para calcular Kd
+int gNextSensorReadout = 0; //"Próximo valor do hall"
+
+int gTargetValue = DEFAULT_TARGET_VALUE;
+float gKp = DEFAULT_KP;
+float gKd = DEFAULT_KD;
+float gKi = DEFAULT_KI;
+int gIntegralError = 0;  //Cálcula do erro
+
+void writeCoilPWM(int value)
+{
+    OCR1B = value;  
+}
+
+
+void setup()
+{  
+    // Configura timer 1 como PWM, 31372.55 Hz.
+    pinMode(9, OUTPUT);
+    pinMode(10, OUTPUT);
+    // WGM20 é usado para PWM de correção de fase, COM2A1/COM2B1 define a saída como não invertida
+    TCCR1A = 0;
+    TCCR1A = _BV(COM2A1) | _BV(COM2B1) | _BV(WGM20);
+    // PWM frequência do PWM 16MHz/255/2/<prescaler>, prescaler 1
+    TCCR1B = 0;
+    TCCR1B = _BV(CS20);
+    
+    pinMode(hallSensorPin, INPUT);
+    
+    Serial.begin(9600);
+    
+}
+
+//Used while in idle mode
+void idleLoop()
+{
+    
+    //Desliga o ímã
+    if(0 != gCurrentDutyCycle)
+    {
+      gCurrentDutyCycle = 0;
+      writeCoilPWM(gCurrentDutyCycle);
+    }
+    
+    int sensorReadout = analogRead(hallSensorPin);
+    
+    //Volta para o modo ativa se encontrar um ímã
+    if(MIN_MAG_LIMIT > sensorReadout)
+    {
+      gIdle = false;
+      gNextSensorReadout = sensorReadout; //Prepara a leitura do sensor
+      gLastSensorReadout = sensorReadout; //Reduz Kd a 0
+      
+      //Usado para evitar overflow em millis
+      gNextPIDCycle = millis();
+      gIdleTime = gNextPIDCycle + IDLE_TIMEOUT_PERIOD;
+    }
+}
+
+//Used while in active mode
+void controlLoop()
+{
+  if(0 <= ((typeof(gNextPIDCycle))millis() - gNextPIDCycle))
+  {
+    gNextPIDCycle = millis() + PID_UPDATE_INTERVAL;
+    
+    //Ler o sensor pelo menos 1 vez a cada ciclo
+    gNextSensorReadout = roundValue(((gNextSensorReadout * (FILTERFACTOR - 1)) + analogRead(hallSensorPin)) / FILTERFACTOR);
+
+    
+    if(MIN_MAG_LIMIT <= gNextSensorReadout) //Sem ímã permanente
+    {
+      if(0 <= ((typeof(gIdleTime))millis() - gIdleTime))
+      {
+        gIdle = true;
+        return; //entra no modo inativo
+      }
+    }
+    else //Íma permanente encontrado 
+    {
+      gIdleTime = millis() + IDLE_TIMEOUT_PERIOD; 
+    }
+    
+    int error = gTargetValue - gNextSensorReadout; //cálculo do erro
+ 
+    //Desvio da entrada ao longo do tempo
+    int dError = gNextSensorReadout - gLastSensorReadout; 
+    
+    gIntegralError = constrain(gIntegralError + error, -DEFAULT_MAX_INTEGRAL, DEFAULT_MAX_INTEGRAL); //erro ao londo do tempo (usado no Ki)
+
+#ifdef QUIETMODE
+    //Diminui mudança no eletroímã
+    int gNextDutyCycle = gMidpoint - roundValue((gKp*error) - (gKd*dError) + (gKi*gIntegralError));
+    gCurrentDutyCycle = roundValue(((gCurrentDutyCycle * 2) + gNextDutyCycle) / 3);
+#else 
+    gCurrentDutyCycle = gMidpoint - roundValue((gKp*error) - (gKd*dError) + (gKi*gIntegralError));
+#endif 
+    gCurrentDutyCycle = constrain(gCurrentDutyCycle, MIN_PWM_VALUE, MAX_PWM_VALUE);
+    
+    writeCoilPWM(gCurrentDutyCycle);
+    
+    //Guarda o próximo cálculo de dError
+    gLastSensorReadout = gNextSensorReadout;
+  }
+  else
+  {
+    //Pega amostras de FILTERFACTOR, substitui uma com o valor atual do sensor hall e calcula a média sobre esse número de entradas.
+    gNextSensorReadout = roundValue(((gNextSensorReadout * (FILTERFACTOR - 1)) + analogRead(hallSensorPin)) / FILTERFACTOR);
+  }
+}
+
+void serialCommand(char command)
+{
+  char output[255];
+  
+  switch(command)
+  {
+    case 'P':
+      gKp += KP_INCREMENT;
+      break;
+    case 'p':
+      gKp -= KP_INCREMENT;
+      if(0 > gKp) gKp = 0;
+      break;
+      
+    case 'D':
+      gKd += KD_INCREMENT;
+      break;
+    case 'd':
+      gKd -= KD_INCREMENT;
+      if(0 > gKd) gKd = 0;
+      break;
+    
+    case 'I':
+      gKi += KI_INCREMENT;
+      break;
+    case 'i':
+      gKi -= KI_INCREMENT;
+      if(0 > gKi) gKi = 0;
+      break;
+      
+    case 'T':
+      gTargetValue += VALUE_INCREMENT;
+      break;
+    case 't':
+      gTargetValue -= VALUE_INCREMENT;
+      if(0 > gTargetValue) gTargetValue = 0;
+      break;
+    
+    case 'V':
+    case 'v':
+      break;
+    
+    default:
+      return;
+  }
+  
+  sprintf(output, "Target Value: [%3d] Current PWM duty cycle [%3d] Current sensor value [%4d] Kp [%2d.%02d] Kd [%2d.%02d] Ki,Integral Error [.%04d,%d] Idle timeout [%d]\n",
+    gTargetValue, 
+    gCurrentDutyCycle, 
+    gNextSensorReadout, 
+    (int)(gKp+0.0001),
+    roundValue(gKp*100)%100, 
+    (int)(gKd+0.0001), 
+    roundValue(gKd*100)%100, 
+    roundValue(gKi*10000)%10000, 
+    gIntegralError, 
+    gIdleTime);
+   
+  Serial.print(output);
+}
+
+void loop()
+{
+    if(0 < Serial.available())
+    {
+      serialCommand(Serial.read());
+    }
+    
+    if(gIdle)
+      idleLoop();  
+    else
+      controlLoop();      
+}
